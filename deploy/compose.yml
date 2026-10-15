@@ -1,0 +1,124 @@
+# Healthchecks: 2 web containers behind Caddy (TLS), backed by one Postgres.
+#
+# Alerting notes:
+#  * sendalerts/sendreports run in their own services, not inside the web
+#    containers. In the upstream image they are uWSGI attach-daemons. On
+#    `docker stop` uWSGI (PID 1) exits within about a second, and the kernel
+#    then SIGKILLs the daemons mid-send. That dropped the alert in flight
+#    (reproduced with deploy/kill_test.py --graceful). Here each one is its
+#    container's main process behind tini (`init: true`). On SIGTERM it stops
+#    claiming new work, finishes what it is sending, and exits within
+#    stop_grace_period.
+#  * Both commands claim work with atomic compare-and-set UPDATEs, so two
+#    sendalerts against the shared Postgres send each alert once, and alerts
+#    keep flowing if one container dies. Never use SQLite here: each container
+#    would get its own database.
+#  * A hard kill (SIGKILL, OOM, power loss) mid-send still loses that one
+#    alert: the flip is marked processed before it is sent. See README.
+#  * Migrations run once, in the one-shot `migrate` service, before anything
+#    else starts. That way the containers don't race on a fresh DB.
+#  * Web containers publish no host ports. Caddy is the only ingress, so the
+#    X-Forwarded-Proto / X-Forwarded-For headers Django trusts are always
+#    the ones Caddy set.
+
+x-hc: &hc
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: healthchecks-local:latest
+  env_file:
+    - .env
+  restart: unless-stopped
+
+# Alert workers: long grace period so an in-flight send can finish. A stop
+# only waits as long as the sends actually take; this is the ceiling before
+# Docker SIGKILLs the worker and loses the alert being sent.
+#   per channel: ~90s (webhook/HTTP: 3 attempts x 30s timeout;
+#                email: 30s timeout, up to 3 attempts on disconnect)
+#   per flip:    channels are notified one after another -> channels x 90s
+#   x2:          sendalerts can claim one more flip after SIGTERM
+#                (process_one_flip runs before its shutdown check)
+# 10m covers flips with up to 3 channels (2 x 3 x ~92s). Raise it if checks
+# get more channels. Reproduced with kill_test.py --graceful --hang-webhook.
+x-worker: &worker
+  <<: *hc
+  init: true
+  stop_grace_period: 10m
+  # The image's HEALTHCHECK probes uWSGI on :8000, which workers don't run.
+  healthcheck:
+    disable: true
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    <<: *hc
+    restart: "no"
+    command: ["./manage.py", "migrate", "--noinput"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web1: &web
+    <<: *hc
+    # HTTP only: no migrate hook, no attach-daemons.
+    command: ["uwsgi", "/etc/hc-uwsgi/web.ini"]
+    volumes:
+      - ./uwsgi:/etc/hc-uwsgi:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web2: *web
+
+  alerts1:
+    <<: *worker
+    command: ["./manage.py", "sendalerts", "--skip-checks"]
+
+  alerts2:
+    <<: *worker
+    command: ["./manage.py", "sendalerts", "--skip-checks"]
+
+  # Monthly/weekly reports and repeat-alert nags.
+  reports:
+    <<: *worker
+    command: ["./manage.py", "sendreports", "--loop", "--skip-checks"]
+
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - HC_DOMAIN=${HC_DOMAIN}
+    volumes:
+      # Mount the directory, not the file: a file bind mount keeps pointing at
+      # the old inode after an editor saves by rename, and reloads break.
+      - ./caddy:/etc/caddy:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - web1
+      - web2

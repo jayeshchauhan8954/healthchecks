@@ -1,0 +1,26 @@
+# Crash-test additions, layered on compose.yml + compose.local.yml:
+# the alert workers send email through a proxy that adds a few seconds per
+# SMTP connection.
+#
+#   docker compose -f compose.yml -f compose.local.yml -f compose.killtest.yml up -d
+
+services:
+  alerts1:
+    environment: &slow
+      EMAIL_HOST: slow-smtp
+  alerts2:
+    environment: *slow
+  reports:
+    environment: *slow
+
+  slow-smtp:
+    image: healthchecks-local:latest
+    # Built locally by compose.yml (the web services), never on a registry.
+    pull_policy: never
+    command: ["python", "/slow_smtp.py"]
+    environment:
+      SMTP_DELAY: ${SMTP_DELAY:-3}
+    volumes:
+      - ./slow_smtp.py:/slow_smtp.py:ro
+    healthcheck:
+      disable: true

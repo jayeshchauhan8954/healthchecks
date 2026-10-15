@@ -1,0 +1,27 @@
+# HC_DOMAIN=localhost -> Caddy issues a cert from its own internal CA.
+# HC_DOMAIN=hc.example.org -> Caddy gets a real cert via ACME (needs 80/443
+# reachable from the internet).
+{$HC_DOMAIN} {
+	# Caddy overwrites any client-supplied X-Forwarded-For / X-Forwarded-Proto,
+	# so Django can trust them.
+	reverse_proxy web1:8000 web2:8000 {
+		lb_policy round_robin
+		# Only retries when the upstream can't be dialed, i.e. the request was
+		# never delivered, so it can't double-count a ping.
+		lb_try_duration 5s
+		# A failed dial closes the request body; buffer it so the retry to the
+		# other web container still has the body (POST pings, API writes).
+		# 1MiB comfortably covers PING_BODY_LIMIT (10000 bytes by default).
+		request_buffers 1MiB
+
+		# Passive: stop sending to an upstream as soon as it fails a request.
+		fail_duration 30s
+		# Active: bring it back once /api/v3/status/ answers again.
+		health_uri /api/v3/status/
+		health_interval 10s
+		# Django rejects the default Host (web1:8000) via ALLOWED_HOSTS.
+		health_headers {
+			Host {$HC_DOMAIN}
+		}
+	}
+}

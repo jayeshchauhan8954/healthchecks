@@ -1,0 +1,47 @@
+# Local-only additions: a mail catcher and a webhook sink, so alert delivery
+# can be checked end to end without real SMTP or a real webhook target.
+#
+#   docker compose -f compose.yml -f compose.local.yml up -d --build
+#
+# Mailpit UI: http://localhost:8025   Webhook sink: http://localhost:8099/_requests
+
+x-local-env: &local-env
+  EMAIL_HOST: mailpit
+  EMAIL_PORT: "1025"
+  EMAIL_USE_TLS: "False"
+  EMAIL_HOST_USER: ""
+  EMAIL_HOST_PASSWORD: ""
+  # The webhook sink lives on the private Docker network.
+  INTEGRATIONS_ALLOW_PRIVATE_IPS: "True"
+  # .env.example closes sign-up (right for production); the UI test signs up.
+  REGISTRATION_OPEN: "True"
+
+services:
+  web1:
+    environment: *local-env
+  web2:
+    environment: *local-env
+  alerts1:
+    environment: *local-env
+  alerts2:
+    environment: *local-env
+  reports:
+    environment: *local-env
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "8025:8025"
+
+  webhook-sink:
+    image: healthchecks-local:latest
+    # Built locally by compose.yml (the web services), never on a registry.
+    pull_policy: never
+    command: ["python", "/sink.py"]
+    volumes:
+      - ./webhook_sink.py:/sink.py:ro
+    ports:
+      - "8099:8080"
+    # The image's HEALTHCHECK probes healthchecks itself, not the sink.
+    healthcheck:
+      disable: true
